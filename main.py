@@ -29,7 +29,6 @@ def mask_email(email: str) -> str:
     if not email or "@" not in email:
         return "***"
     user, domain = email.split("@", 1)
-    # 域名也脱敏：只保留顶级域名最后一段
     domain_parts = domain.split(".")
     masked_domain = "***." + domain_parts[-1] if len(domain_parts) >= 2 else "***"
     return f"{user[:3]}***@{masked_domain}"
@@ -307,7 +306,15 @@ def get_websocket_credentials(full_uuid: str, bearer_token: str) -> Tuple[Option
         return None, None
 
 # ---------- WebSocket 开机 ----------
-async def ws_start_server(socket_url: str, jwt: str) -> bool:
+async def ws_start_server(socket_url: str, jwt: str) -> str:
+    """
+    返回值:
+      "already_running" - 服务器已在运行，无需开机
+      "started"         - 已发送开机指令并确认启动
+      "sent"            - 已发送开机指令，等待超时但指令已发出
+      "auth_failed"     - WS认证失败
+      "error"           - 其他异常
+    """
     print(f"[INFO] 连接 WebSocket...", flush=True)
     try:
         async with websockets.connect(
@@ -337,14 +344,11 @@ async def ws_start_server(socket_url: str, jwt: str) -> bool:
 
             if not auth_success:
                 print("[ERROR] WS认证失败", flush=True)
-                return False
+                return "auth_failed"
 
-            # -------------------------------------------------------
-            # 认证成功后，服务器会立即推送 status / stats 等事件
-            # 在短时间窗口内收集状态，避免卡住
-            # -------------------------------------------------------
+            # 收集服务器推送的初始状态（最多等 5s）
             current_status = "unknown"
-            deadline = asyncio.get_event_loop().time() + 5  # 最多等 5s
+            deadline = asyncio.get_event_loop().time() + 5
             while asyncio.get_event_loop().time() < deadline:
                 remaining = deadline - asyncio.get_event_loop().time()
                 try:
@@ -355,7 +359,6 @@ async def ws_start_server(socket_url: str, jwt: str) -> bool:
                     if event == "status":
                         current_status = data.get("args", ["unknown"])[0]
                         print(f"[INFO] 服务器当前状态: {current_status}", flush=True)
-                        # 收到明确状态后即可退出收集循环
                         break
 
                     elif event == "stats":
@@ -369,21 +372,20 @@ async def ws_start_server(socket_url: str, jwt: str) -> bool:
                             pass
 
                 except asyncio.TimeoutError:
-                    # 5s 内没有收到任何状态消息，保持 unknown
                     break
                 except Exception:
                     break
 
-            # 已在运行/启动中 → 无需再发开机指令，直接返回
+            # 已在运行/启动中 → 无需发开机指令
             if current_status in ("running", "starting"):
                 print(f"[INFO] 服务器已在运行中（{current_status}），无需开机", flush=True)
-                return True
+                return "already_running"
 
             # 未运行 → 发送开机指令
             await ws.send(json.dumps({"event": "set state", "args": ["start"]}))
             print("[INFO] 已发送开机指令，等待启动...", flush=True)
 
-            # 等待状态变更确认（最多 60×5=300s）
+            # 等待状态变更确认
             for _ in range(60):
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -395,14 +397,14 @@ async def ws_start_server(socket_url: str, jwt: str) -> bool:
                         print(f"[INFO] 状态变更: {new_status}", flush=True)
                         if new_status in ("starting", "running"):
                             print(f"[INFO] ✅ 服务器启动成功（{new_status}）", flush=True)
-                            return True
+                            return "started"
 
                     elif event == "stats":
                         try:
                             state = json.loads(data["args"][0]).get("state", "")
                             if state in ("starting", "running"):
                                 print(f"[INFO] ✅ 服务器启动成功（{state}）", flush=True)
-                                return True
+                                return "started"
                         except Exception:
                             pass
 
@@ -412,22 +414,23 @@ async def ws_start_server(socket_url: str, jwt: str) -> bool:
                     break
 
             print("[WARN] 等待超时，开机指令已发送", flush=True)
-            return True
+            return "sent"
 
     except Exception as e:
         print(f"[ERROR] WebSocket异常: {e}", flush=True)
-        return False
+        return "error"
 
-def start_server_via_ws(full_uuid: str, bearer_token: str) -> bool:
+
+def start_server_via_ws(full_uuid: str, bearer_token: str) -> str:
     jwt, socket_url = get_websocket_credentials(full_uuid, bearer_token)
     if not jwt or not socket_url:
         print("[ERROR] 无法获取WS凭证", flush=True)
-        return False
+        return "error"
     try:
         return asyncio.run(ws_start_server(socket_url, jwt))
     except Exception as e:
         print(f"[ERROR] WS开机异常: {e}", flush=True)
-        return False
+        return "error"
 
 # ---------- 单账号主流程 ----------
 def process_account(key: str, proxy: str = None) -> bool:
@@ -510,11 +513,19 @@ def process_account(key: str, proxy: str = None) -> bool:
 
     # 4. WS 开机
     print(f"[INFO] ── 开机 ──", flush=True)
-    start_ok = start_server_via_ws(full_uuid, bearer_token)
-    start_note = "✅ 开机指令已发送" if start_ok else "⚠️ 开机失败或已在运行"
+    start_result = start_server_via_ws(full_uuid, bearer_token)
+
+    start_note_map = {
+        "already_running": "✅ 服务器已在运行中，无需开机",
+        "started":         "✅ 开机成功",
+        "sent":            "✅ 开机指令已发送（等待超时）",
+        "auth_failed":     "⚠️ WS认证失败",
+        "error":           "⚠️ 开机异常",
+    }
+    start_note = start_note_map.get(start_result, "⚠️ 未知状态")
     print(f"[INFO] {start_note}", flush=True)
 
-    # 5. TG 通知
+    # 5. TG 通知（使用真实邮箱和服务器ID）
     notify_tg(
         ok=renew_ok,
         email=user,
