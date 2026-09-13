@@ -68,6 +68,16 @@ def extract_server_identity(payload: dict) -> Tuple[Optional[str], Optional[str]
             return full_uuid, short_id or full_uuid.split("-", 1)[0]
     return None, None
 
+
+def fetch_server_identity(bearer_token: str) -> Tuple[Optional[str], Optional[str]]:
+    """用 Bearer Token 主动请求服务器列表 API，作为页面监听的兜底。"""
+    resp = requests.get(
+        f"{API_BASE}/servers?page=1&locale=en",
+        headers=api_headers(bearer_token),
+        timeout=30,
+    )
+    return extract_server_identity(resp.json())
+
 # ---------- 工具函数 ----------
 def cn_time():
     return datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -150,8 +160,9 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
         try:
             payload = response.json()
             full_uuid, short_id = extract_server_identity(payload)
-        except Exception:
-            pass
+            print(f"[DEBUG] servers API {response.status}: uuid={mask_server(full_uuid) or 'NONE'}", flush=True)
+        except Exception as e:
+            print(f"[DEBUG] servers API 解析失败 (http={response.status}): {e}", flush=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -240,6 +251,17 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                         full_uuid = m.group(0)
                 except:
                     pass
+
+            if not full_uuid and bearer_token:
+                # 兜底：页面监听未命中时，主动用 Token 请求服务器列表
+                try:
+                    full_uuid, short_id = fetch_server_identity(bearer_token)
+                    if full_uuid:
+                        print("[INFO] 通过服务器列表 API 获取 UUID", flush=True)
+                    else:
+                        print(f"[WARN] 服务器列表 API 未返回 UUID", flush=True)
+                except Exception as e:
+                    print(f"[WARN] 服务器列表 API 获取 UUID 失败: {e}", flush=True)
 
             return bearer_token, full_uuid, short_id
 

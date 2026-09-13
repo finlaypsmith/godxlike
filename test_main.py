@@ -2,7 +2,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # main.py 的浏览器依赖在工作流中安装；单元测试只替换导入所需的模块。
 playwright_module = MagicMock()
@@ -12,7 +12,7 @@ sys.modules.setdefault("playwright", playwright_module)
 sys.modules.setdefault("playwright.sync_api", playwright_module.sync_api)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from main import extract_server_identity, load_env_file
+from main import extract_server_identity, fetch_server_identity, load_env_file
 
 
 class MainHelpersTest(unittest.TestCase):
@@ -54,6 +54,28 @@ class MainHelpersTest(unittest.TestCase):
                 os.environ.pop("TEST_EXISTING", None)
             else:
                 os.environ["TEST_EXISTING"] = old_existing
+
+    def test_fetch_server_identity_calls_servers_api_with_bearer(self):
+        payload = {
+            "success": True,
+            "data": [{
+                "uuidShort": "5515686b",
+                "uuid": "5515686b-2beb-4edf-9144-d5769c940fe1",
+            }],
+        }
+        mock_response = MagicMock()
+        mock_response.json.return_value = payload
+
+        with patch("main.requests.get", return_value=mock_response) as mocked_get:
+            full_uuid, short_id = fetch_server_identity("ptlc_dummy")
+
+        self.assertEqual(full_uuid, "5515686b-2beb-4edf-9144-d5769c940fe1")
+        self.assertEqual(short_id, "5515686b")
+        self.assertIn("/api/v2/servers", mocked_get.call_args.args[0])
+        self.assertEqual(
+            mocked_get.call_args.kwargs["headers"]["Authorization"],
+            "Bearer ptlc_dummy",
+        )
 
 
 if __name__ == "__main__":
