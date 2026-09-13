@@ -20,6 +20,54 @@ OUTPUT_DIR = Path("scripts/Godlike")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CN_TZ = timezone(timedelta(hours=8))
 
+
+def load_env_file(path: Path) -> None:
+    """加载本地 .env，仅填充尚未存在的环境变量。"""
+    if not path.is_file():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or key in os.environ:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+load_env_file(Path(__file__).with_name(".env"))
+
+
+def extract_server_identity(payload: dict) -> Tuple[Optional[str], Optional[str]]:
+    """从服务器列表 API 响应中提取完整 UUID 和短 ID。"""
+    servers = payload.get("data", []) if isinstance(payload, dict) else []
+    if isinstance(servers, dict):
+        servers = servers.get("data", [])
+    if not isinstance(servers, list):
+        return None, None
+
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        full_uuid = server.get("uuid")
+        short_id = server.get("uuidShort")
+        if isinstance(full_uuid, str) and re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            full_uuid,
+        ):
+            return full_uuid, short_id or full_uuid.split("-", 1)[0]
+    return None, None
+
 # ---------- 工具函数 ----------
 def cn_time():
     return datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -95,6 +143,16 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
             full_uuid = m.group(1)
             short_id = full_uuid.split('-')[0]
 
+    def on_response(response):
+        nonlocal full_uuid, short_id
+        if full_uuid or "/api/v2/servers" not in response.url:
+            return
+        try:
+            payload = response.json()
+            full_uuid, short_id = extract_server_identity(payload)
+        except Exception:
+            pass
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -106,6 +164,7 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
         )
         page = context.new_page()
         page.on("request", on_request)
+        page.on("response", on_response)
 
         try:
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
